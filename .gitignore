@@ -1,0 +1,9 @@
+*.o
+*.ex
+*.sh
+*.log
+*.bin
+*.asv
+*.fig
+*.png
+*.DS_Store
