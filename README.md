@@ -10,119 +10,38 @@ While efforts have been made to ensure correctness, the code may contain bugs or
 
 ## C++
 
+0. Development
+
+   The C++ code was developed by Tianshi Xu under the advisory of Yuanzhe Xi and Yousef Saad. Other co-authors have **NO CONTRIBUTION** to the source code and the experiments.
+
 1. Building
 
-Basic build:
-```bash
-mkdir build
-cd build
-cmake ..
-make
-```
+   Basic build:
+   ```bash
+   cd CPP
+   mkdir build
+   cd build
+   cmake -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug ..
+   make
+   ```
 
-Build with tests enabled:
-```bash
-mkdir build
-cd build
-cmake -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug ..
-make
-```
+2. Validation
 
-Build with debug information:
-```bash
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Debug ..
-make
-```
+   ```bash
+   ctest --verbose
+   ```
 
-## Running Tests
+3. Reproduce the results in the manuscript
 
-After building with tests enabled:
+   ```bash
+   ./examples/ex00
+   ```
 
-```bash
-# Run all tests
-cd build
-ctest
+## MATLAB
 
-# Or run specific tests
-./tests/vector_test
-./tests/matrix_test
-./tests/mvops_test
-```
+1. Reproduce the results in the manuscript
 
-Run tests with more detailed output:
-```bash
-cd build
-ctest --verbose
-```
-
-## Code Coverage
-
-To build with code coverage enabled:
-
-```bash
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON ..
-make
-```
-
-Run tests to generate coverage data:
-```bash
-cd build
-# Run all tests
-make test
-
-# Or run specific tests
-./tests/vector_test
-./tests/matrix_test
-./tests/mvops_test
-```
-
-Generate coverage report:
-```bash
-cd build
-# Generate coverage report (assuming you have coverage target configured)
-make coverage
-
-# Or manually generate with lcov
-lcov --directory . --capture --output-file coverage.info
-# Filter out system headers and test files
-lcov --remove coverage.info '/usr/*' '/home/*/googletest/*' '*/tests/*' --output-file coverage.info
-# Generate HTML report
-genhtml coverage.info --output-directory coverage_report
-```
-
-View the coverage report:
-```bash
-# Open index.html in the coverage_report directory
-firefox coverage_report/index.html
-```
-
-## Usage
-
-```cpp
-#include "containers/vector.hpp"
-
-// Create a vector on the device
-msvd::Vector<float> device_vec(1000, msvd::Location::kDEVICE);
-
-// Fill it with random values
-device_vec.fill_random();
-
-// Transfer to host
-device_vec.to_host();
-
-// Convert to double precision
-msvd::Vector<double> double_vec = device_vec.cast<double>();
-
-// Access elements (on host)
-for (size_t i = 0; i < double_vec.length(); i++) {
-   double value = double_vec.data()[i];
-   // Do something with the value
-}
-```
+   Simply go to folder MATLAB and run test scripts
 
 ## License
 
