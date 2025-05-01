@@ -97,6 +97,36 @@ fig.Position = [100, 100, fig_width, fig_height];
 
 saveas(fig, 'test_00.png');
 
+% Save data to log file
+log_file = 'test00_data.log';
+fid = fopen(log_file, 'w');
+
+% Write header
+fprintf(fid, 'Eigenvalue_Index\t');
+fprintf(fid, 'True_Eigenvalue\t');
+fprintf(fid, 'double_double\tdouble_double_rel_err\t');
+fprintf(fid, 'single_single\tsingle_single_rel_err\t');
+fprintf(fid, 'single_double\tsingle_double_rel_err\t');
+fprintf(fid, 'half_half\thalf_half_rel_err\t');
+fprintf(fid, 'half_single\thalf_single_rel_err\t');
+fprintf(fid, 'half_double\thalf_double_rel_err\n');
+
+% Write data
+for i = 1:k
+   fprintf(fid, '%d\t', i);
+   fprintf(fid, '%.15e\t', eig_true(i));
+   
+   fprintf(fid, '%.15e\t%.15e\t', eig_double_double(i), abs(eig_double_double(i) - eig_true(i))/abs(eig_true(i)));
+   fprintf(fid, '%.15e\t%.15e\t', eig_single_single(i), abs(eig_single_single(i) - eig_true(i))/abs(eig_true(i)));
+   fprintf(fid, '%.15e\t%.15e\t', eig_single_double(i), abs(eig_single_double(i) - eig_true(i))/abs(eig_true(i)));
+   fprintf(fid, '%.15e\t%.15e\t', eig_half_half(i), abs(eig_half_half(i) - eig_true(i))/abs(eig_true(i)));
+   fprintf(fid, '%.15e\t%.15e\t', eig_half_single(i), abs(eig_half_single(i) - eig_true(i))/abs(eig_true(i)));
+   fprintf(fid, '%.15e\t%.15e\n', eig_half_double(i), abs(eig_half_double(i) - eig_true(i))/abs(eig_true(i)));
+end
+
+fclose(fid);
+fprintf('Data saved to %s\n', log_file);
+
 function [eig_values, k] = test_subspace_iter_eig(K, m, k, maxiter, iter, seed, ...
                                                  precision_subspace_compute, precision_subspace_output, ...
                                                  precision_mgs_compute, precision_mgs_output)
