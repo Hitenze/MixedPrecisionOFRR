@@ -5,6 +5,9 @@
 #include "../containers/matrix.hpp"
 #include "../core/utils/cuda_handler.hpp"
 #include "../core/utils/type_utils.hpp"
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <iostream>
 #include <vector>
 #include <random>
@@ -25,6 +28,176 @@ public:
       CUDAHandler::finalize();
    }
 };
+
+namespace {
+
+enum class QRAlgorithm {
+   kMGS,
+   kMGSV2,
+   kCGS,
+   kCGS2
+};
+
+struct QRAlgorithmCase {
+   const char* name;
+   QRAlgorithm algorithm;
+};
+
+struct MatrixShape {
+   size_t rows;
+   size_t cols;
+};
+
+template<typename T>
+T qr_test_value(double value) {
+   return static_cast<T>(value);
+}
+
+template<>
+__half qr_test_value<__half>(double value) {
+   return __float2half(static_cast<float>(value));
+}
+
+template<typename T>
+double qr_test_double(T value) {
+   return static_cast<double>(value);
+}
+
+template<>
+double qr_test_double<__half>(__half value) {
+   return static_cast<double>(__half2float(value));
+}
+
+template<typename T, typename T_COMPUTE>
+void check_qr_shape(
+   const QRAlgorithmCase& algorithm_case,
+   const MatrixShape& shape,
+   const char* precision,
+   double orthogonality_tolerance,
+   double reconstruction_tolerance
+) {
+   SCOPED_TRACE(::testing::Message()
+      << "algorithm=" << algorithm_case.name
+      << ", precision=" << precision
+      << ", shape=" << shape.rows << "x" << shape.cols);
+
+   Matrix<T> A(shape.rows, shape.cols, Location::kHOST);
+   std::vector<double> original(shape.rows * shape.cols);
+   for (size_t j = 0; j < shape.cols; ++j) {
+      for (size_t i = 0; i < shape.rows; ++i) {
+         // The leading identity keeps every tested matrix well conditioned,
+         // while the dense perturbation exercises all rows of every column.
+         const double value = (i == j ? 2.0 : 0.0)
+            + 0.02 * std::sin(0.37 * static_cast<double>((i + 1) * (j + 1)));
+         A(i, j) = qr_test_value<T>(value);
+         original[i + j * shape.rows] = qr_test_double(A(i, j));
+      }
+   }
+   A.to_device();
+
+   Matrix<T> Q(shape.rows, shape.cols, Location::kDEVICE);
+   Matrix<T> R(shape.cols, shape.cols, Location::kHOST);
+   std::vector<int> skip;
+   switch (algorithm_case.algorithm) {
+      case QRAlgorithm::kMGS:
+         skip = mgs<T, T, T_COMPUTE>(A, Q, R);
+         break;
+      case QRAlgorithm::kMGSV2:
+         skip = mgs_v2<T, T, T_COMPUTE>(A, Q, R);
+         break;
+      case QRAlgorithm::kCGS:
+         skip = cgs<T, T, T_COMPUTE>(A, Q, R);
+         break;
+      case QRAlgorithm::kCGS2:
+         skip = cgs2<T, T, T_COMPUTE>(A, Q, R);
+         break;
+   }
+
+   const cudaError_t sync_status = cudaDeviceSynchronize();
+   ASSERT_EQ(sync_status, cudaSuccess) << cudaGetErrorString(sync_status);
+   ASSERT_EQ(skip.size(), shape.cols);
+   for (size_t j = 0; j < shape.cols; ++j) {
+      ASSERT_EQ(skip[j], 0) << "unexpectedly skipped column " << j;
+   }
+
+   Q.to_host();
+   for (size_t j = 0; j < shape.cols; ++j) {
+      for (size_t i = 0; i < shape.rows; ++i) {
+         ASSERT_TRUE(std::isfinite(qr_test_double(Q(i, j))))
+            << "non-finite Q(" << i << ", " << j << ")";
+      }
+      for (size_t i = 0; i < shape.cols; ++i) {
+         ASSERT_TRUE(std::isfinite(qr_test_double(R(i, j))))
+            << "non-finite R(" << i << ", " << j << ")";
+      }
+   }
+
+   double max_orthogonality_error = 0.0;
+   for (size_t j = 0; j < shape.cols; ++j) {
+      for (size_t k = 0; k < shape.cols; ++k) {
+         double dot_product = 0.0;
+         for (size_t i = 0; i < shape.rows; ++i) {
+            dot_product += qr_test_double(Q(i, j)) * qr_test_double(Q(i, k));
+         }
+         const double expected = j == k ? 1.0 : 0.0;
+         max_orthogonality_error = std::max(
+            max_orthogonality_error, std::abs(dot_product - expected));
+      }
+   }
+   EXPECT_LT(max_orthogonality_error, orthogonality_tolerance);
+
+   double max_reconstruction_error = 0.0;
+   for (size_t j = 0; j < shape.cols; ++j) {
+      for (size_t i = 0; i < shape.rows; ++i) {
+         double reconstructed = 0.0;
+         for (size_t k = 0; k < shape.cols; ++k) {
+            reconstructed += qr_test_double(Q(i, k)) * qr_test_double(R(k, j));
+         }
+         max_reconstruction_error = std::max(
+            max_reconstruction_error,
+            std::abs(reconstructed - original[i + j * shape.rows]));
+      }
+   }
+   EXPECT_LT(max_reconstruction_error, reconstruction_tolerance);
+}
+
+} // namespace
+
+// Cover degenerate, square, tall, and CUDA boundary-adjacent dimensions for
+// every QR implementation without making the regular test suite expensive.
+TEST(QRTest, MultipleShapesCudaRegression) {
+   const std::array<QRAlgorithmCase, 4> algorithms{{
+      {"MGS", QRAlgorithm::kMGS},
+      {"MGS_V2", QRAlgorithm::kMGSV2},
+      {"CGS", QRAlgorithm::kCGS},
+      {"CGS2", QRAlgorithm::kCGS2}
+   }};
+   const std::array<MatrixShape, 6> shapes{{
+      {1, 1},
+      {7, 3},
+      {31, 31},
+      {33, 7},
+      {255, 9},
+      {257, 9}
+   }};
+   const std::array<MatrixShape, 2> mixed_precision_shapes{{
+      {37, 5},
+      {1025, 3}
+   }};
+
+   for (const QRAlgorithmCase& algorithm_case : algorithms) {
+      for (const MatrixShape& shape : shapes) {
+         ASSERT_NO_FATAL_FAILURE((check_qr_shape<double, double>(
+            algorithm_case, shape, "double", 1e-10, 1e-10)));
+      }
+      for (const MatrixShape& shape : mixed_precision_shapes) {
+         ASSERT_NO_FATAL_FAILURE((check_qr_shape<float, float>(
+            algorithm_case, shape, "float", 2e-5, 2e-5)));
+         ASSERT_NO_FATAL_FAILURE((check_qr_shape<__half, float>(
+            algorithm_case, shape, "half/float-compute", 2e-2, 2e-2)));
+      }
+   }
+}
 
 // Test double precision QR
 TEST(QRTest, MGS_DoublePrecision) {
@@ -382,6 +555,48 @@ TEST(QRTest, CGS2_DoublePrecision) {
    EXPECT_LT(max_diff, tol);
 }
 
+// CGS2 must apply the second projection to Q, not only accumulate it in R.
+TEST(QRTest, CGS2_ReorthogonalizesNearlyDependentColumns) {
+   const size_t m = 3;
+   const size_t n = 2;
+   const double delta = 1e-8;
+
+   Matrix<double> A(m, n, Location::kHOST);
+   A.fill(0.0);
+   A(0, 0) = 1.0;
+   A(1, 0) = delta;
+   A(0, 1) = 1.0;
+   A(2, 1) = delta;
+   A.to_device();
+
+   Matrix<double> Q(m, n, Location::kDEVICE);
+   Matrix<double> R(n, n, Location::kHOST);
+   const std::vector<int> skip = cgs2<double, double, double>(A, Q, R);
+
+   ASSERT_EQ(skip.size(), n);
+   EXPECT_EQ(skip[0], 0);
+   EXPECT_EQ(skip[1], 0);
+
+   Matrix<double> QTQ(n, n, Location::kDEVICE);
+   gemm<double, double, double>(true, false, 1.0, Q, Q, 0.0, QTQ);
+   QTQ.to_host();
+   EXPECT_NEAR(QTQ(0, 0), 1.0, 1e-14);
+   EXPECT_NEAR(QTQ(1, 1), 1.0, 1e-14);
+   EXPECT_NEAR(QTQ(0, 1), 0.0, 1e-12);
+   EXPECT_NEAR(QTQ(1, 0), 0.0, 1e-12);
+
+   Matrix<double> QR(m, n, Location::kDEVICE);
+   R.to_device();
+   gemm<double, double, double>(false, false, 1.0, Q, R, 0.0, QR);
+   A.to_host();
+   QR.to_host();
+   for (size_t j = 0; j < n; j++) {
+      for (size_t i = 0; i < m; i++) {
+         EXPECT_NEAR(QR(i, j), A(i, j), 1e-14);
+      }
+   }
+}
+
 // Test single precision CGS2
 TEST(QRTest, CGS2_SinglePrecision) {
    const size_t m = 2000;
@@ -655,4 +870,4 @@ int main(int argc, char **argv) {
    ::testing::InitGoogleTest(&argc, argv);
    ::testing::AddGlobalTestEnvironment(new msvd::QRTestEnvironment);
    return RUN_ALL_TESTS();
-} 
+}

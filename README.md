@@ -12,7 +12,7 @@ While efforts have been made to ensure correctness, the code may contain bugs or
 
 0. Development
 
-   The C++ code was developed by Tianshi Xu under the advisory of Yuanzhe Xi and Yousef Saad. Other co-authors have **NO CONTRIBUTION** to the source code and the experiments.
+   The C++ code was developed by Tianshi Xu under the advisory of Yuanzhe Xi and Yousef Saad.
 
 1. Building
 

@@ -1,266 +1,198 @@
-#include "../linalg/factorization/qr.hpp"
-#include "../linalg/factorization/hessenberg.hpp"
-#include "../linalg/blas/mvops.hpp"
-#include "../containers/vector.hpp"
+#include "cuda_event_timer.hpp"
+
 #include "../containers/matrix.hpp"
 #include "../core/utils/cuda_handler.hpp"
 #include "../core/utils/type_utils.hpp"
-#include <iostream>
-#include <vector>
-#include <chrono>
-#include <iomanip>
+#include "../linalg/blas/mvops.hpp"
+#include "../linalg/factorization/hessenberg.hpp"
+#include "../linalg/factorization/qr.hpp"
+
 #include <cuda_fp16.h>
 
-using namespace msvd;
-using namespace std;
-using namespace std::chrono;
+#include <cstdlib>
+#include <exception>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
-// Timer utility function
-template<typename T>
-double measure_time(T&& func) {
-   auto start = high_resolution_clock::now();
-   func();
-   auto end = high_resolution_clock::now();
-   duration<double, milli> elapsed = end - start;
-   return elapsed.count();
-}
+namespace {
 
-// Helper function to get double value from different types
-template<typename T>
-double to_double(const T& value) {
+using msvd::CUDAHandler;
+using msvd::Location;
+using msvd::Matrix;
+using msvd::examples::CudaEventTimer;
+using msvd::examples::throw_if_error;
+
+template<typename T, typename T_COMPUTE>
+std::string precision_name() {
    if constexpr (std::is_same_v<T, double>) {
-      return value;
+      return "double";
    } else if constexpr (std::is_same_v<T, float>) {
-      return static_cast<double>(value);
-   } else if constexpr (std::is_same_v<T, __half>) {
-      return static_cast<double>(__half2float(value));
+      return "float";
+   } else if constexpr (std::is_same_v<T, __half> && std::is_same_v<T_COMPUTE, float>) {
+      return "half (FP32 compute)";
    } else {
-      return static_cast<double>(value);
+      return "unknown";
    }
 }
 
-// dummy function to run before all tests, run some simple warmup to fill the cache and GPU
 void warmup() {
    Matrix<double> A(1000, 1000, Location::kDEVICE);
-   A.fill_random();
    Matrix<double> B(1000, 1000, Location::kDEVICE);
+   A.fill_random();
 
-   for (int i = 0; i < 10; i++) {
-      gemm<double, double, double>(true, false, get_one<double>(), A, A, get_zero<double>(), B);
+   for (int i = 0; i < 10; ++i) {
+      throw_if_error(
+         msvd::gemm<double, double, double>(
+            true,
+            false,
+            msvd::get_one<double>(),
+            A,
+            A,
+            msvd::get_zero<double>(),
+            B
+         ),
+         "warmup GEMM"
+      );
    }
+
+   // Do not let initialization or warmup work leak into the first measurement.
+   CudaEventTimer::synchronize_device();
 }
 
-// Test function to compare different QR factorization methods
-template<typename T>
-void compare_qr_methods(size_t m, size_t n, int ntests) {
-   cout << "========== Testing " << (std::is_same<T, double>::value ? "double" : 
-                                   (std::is_same<T, float>::value ? "float" : "half")) 
-        << " precision (" << m << "x" << n << ") ==========" << endl;
-   
-   // Create matrices
+template<typename Function>
+void benchmark_method(
+   const char* name,
+   int repetitions,
+   CudaEventTimer& timer,
+   Function&& function
+) {
+   if (repetitions <= 0) {
+      throw std::invalid_argument("benchmark repetitions must be positive");
+   }
+
+   const double total_ms = timer.measure_ms([&]() {
+      for (int i = 0; i < repetitions; ++i) {
+         std::invoke(function);
+      }
+   });
+
+   std::cout << std::setw(18) << (std::string(name) + ": ")
+             << std::fixed << std::setprecision(3)
+             << total_ms / static_cast<double>(repetitions) << '\n';
+}
+
+template<typename T, typename T_COMPUTE>
+void compare_qr_methods(
+   std::size_t m,
+   std::size_t n,
+   int repetitions,
+   CudaEventTimer& timer
+) {
+   std::cout << "========== Testing " << precision_name<T, T_COMPUTE>()
+             << " precision (" << m << 'x' << n << ") ==========\n";
+
    Matrix<T> A(m, n, Location::kDEVICE);
    Matrix<T> Q(m, n, Location::kDEVICE);
    Matrix<T> R(n, n, Location::kHOST);
-   
-   // Fill A with random values
    A.fill_random();
-   cout << "Method comparison (execution time, ms):" << endl;
-   
-   // Save a copy of A for different methods
-   Matrix<T> A_copy(A);
-   
-   // Test MGS method without re-orthogonalization
-   double mgs_time = measure_time([&]() {
-      for (int i = 0; i < ntests; i++) {
-         std::vector<int> skip = mgs<T, T, T>(A, Q, R, get_eps<T>(), get_eps<T>(), T(-1.0));
-      }
-   });
-   cout << setw(15) << "MGS: " << fixed << setprecision(3) << mgs_time / static_cast<double>(ntests) << endl;
-   
-   A = Matrix<T>(A_copy);
-   
-   // Test MGS method with re-orthogonalization
-   double mgsr_time = measure_time([&]() {
-      for (int i = 0; i < ntests; i++) {
-         std::vector<int> skip = mgs<T, T, T>(A, Q, R);
-      }
-   });
-   cout << setw(15) << "MGS R: " << fixed << setprecision(3) << mgsr_time / static_cast<double>(ntests) << endl;
-   
-   A = Matrix<T>(A_copy);
-   
-   // Test MGS_V2 method (right-looking)
-   double mgs_v2_time = measure_time([&]() {
-      for (int i = 0; i < ntests; i++) {
-         std::vector<int> skip = mgs_v2<T, T, T>(A, Q, R);
-      }
-   });
-   cout << setw(15) << "MGS V2: " << fixed << setprecision(3) << mgs_v2_time / static_cast<double>(ntests) << endl;
 
-   A = Matrix<T>(A_copy);
-   
-   // Test CGS method
-   double cgs_time = measure_time([&]() {
-      for (int i = 0; i < ntests; i++) {
-         std::vector<int> skip = cgs<T, T, T>(A, Q, R);
-      }
-   });
-   cout << setw(15) << "CGS: " << fixed << setprecision(3) << cgs_time / static_cast<double>(ntests) << endl;
+   std::cout << "Method comparison (average CUDA-event elapsed time per run, ms):\n";
 
-   A = Matrix<T>(A_copy);
-   
-   // Test CGS2 method (with re-orthogonalization)
-   double cgs2_time = measure_time([&]() {
-      for (int i = 0; i < ntests; i++) {
-         std::vector<int> skip = cgs2<T, T, T>(A, Q, R);
-      }
+   benchmark_method("MGS", repetitions, timer, [&]() {
+      (void)msvd::mgs<T, T, T_COMPUTE>(
+         A,
+         Q,
+         R,
+         msvd::get_eps<T>(),
+         msvd::get_eps<T>(),
+         msvd::get_negone<T>()
+      );
    });
-   cout << setw(15) << "CGS2: " << fixed << setprecision(3) << cgs2_time / static_cast<double>(ntests) << endl;
 
-   A = Matrix<T>(A_copy);
-
-   // Test Hessenberg method
-   double hess_time = measure_time([&]() {
-      for (int i = 0; i < ntests; i++) {
-         std::vector<int> skip = hessenberg<T, T, T>(A, Q, R);
-      }
+   benchmark_method("MGS R", repetitions, timer, [&]() {
+      (void)msvd::mgs<T, T, T_COMPUTE>(A, Q, R);
    });
-   cout << setw(15) << "Hessenberg: " << fixed << setprecision(3) << hess_time / static_cast<double>(ntests) << endl;
 
-   A = Matrix<T>(A_copy);
-   
-   // Test Hessenberg V2 method (customized kernel version)
-   double hess_v2_time = measure_time([&]() {
-      for (int i = 0; i < ntests; i++) {
-         std::vector<int> skip = hessenberg_v2<T, T, T>(A, Q, R);
-      }
+   benchmark_method("MGS V2", repetitions, timer, [&]() {
+      (void)msvd::mgs_v2<T, T, T_COMPUTE>(A, Q, R);
    });
-   cout << setw(15) << "Hessenberg V2: " << fixed << setprecision(3) << hess_v2_time / static_cast<double>(ntests) << endl;
 
-   A = Matrix<T>(A_copy);
-   
-   // Test Hessenberg V3 method (GEMM-based version)
-   double hess_v3_time = measure_time([&]() {
-      for (int i = 0; i < ntests; i++) {
-         std::vector<int> skip = hessenberg_v3<T, T, T>(A, Q, R);
-      }
+   benchmark_method("CGS", repetitions, timer, [&]() {
+      (void)msvd::cgs<T, T, T_COMPUTE>(A, Q, R);
    });
-   cout << setw(15) << "Hessenberg V3: " << fixed << setprecision(3) << hess_v3_time / static_cast<double>(ntests) << endl;
-   cout << endl;
+
+   benchmark_method("CGS2", repetitions, timer, [&]() {
+      (void)msvd::cgs2<T, T, T_COMPUTE>(A, Q, R);
+   });
+
+   benchmark_method("Hessenberg", repetitions, timer, [&]() {
+      (void)msvd::hessenberg<T, T, T_COMPUTE>(A, Q, R);
+   });
+
+   benchmark_method("Hessenberg V2", repetitions, timer, [&]() {
+      (void)msvd::hessenberg_v2<T, T, T_COMPUTE>(A, Q, R);
+   });
+
+   benchmark_method("Hessenberg V3", repetitions, timer, [&]() {
+      (void)msvd::hessenberg_v3<T, T, T_COMPUTE>(A, Q, R);
+   });
+
+   std::cout << '\n';
 }
 
-int main() {
-
-   int ntests = 5;
-
-   // Initialize CUDA
-   CUDAHandler::init();
-   
-   // Set different matrix sizes
-   vector<pair<size_t, size_t>> matrix_sizes = {
-      {25000, 200},   // Small size (same as hessenberg_test)
-      {50000, 200},   // Medium size
-      {50000, 400}   // Large size
+void run_benchmarks() {
+   constexpr int repetitions = 5;
+   const std::vector<std::pair<std::size_t, std::size_t>> matrix_sizes = {
+      {25000, 200},
+      {50000, 200},
+      {50000, 400}
    };
-   
-   cout << "===============================================" << endl;
-   cout << "QR Factorization Methods Performance Comparison" << endl;
-   cout << "===============================================" << endl;
+
+   CudaEventTimer timer;
+
+   std::cout << "===============================================\n"
+             << "QR Factorization Methods Performance Comparison\n"
+             << "===============================================\n";
 
    warmup();
-   
-   // Test different sizes and types
+
    for (const auto& [m, n] : matrix_sizes) {
-      compare_qr_methods<double>(m, n, ntests);
-      compare_qr_methods<float>(m, n, ntests);
-      
-      // For half precision, use float as compute type
-      cout << "========== Testing half precision (" << m << "x" << n << ") ==========" << endl;
-      
-      Matrix<__half> A(m, n, Location::kDEVICE);
-      Matrix<__half> Q(m, n, Location::kDEVICE);
-      Matrix<__half> R(n, n, Location::kHOST);
-      
-      A.fill_random();
-      cout << "Method comparison (execution time, ms):" << endl;
-
-      Matrix<__half> A_copy(A);
-      
-      double mgs_time = measure_time([&]() {
-         for (int i = 0; i < ntests; i++) {
-            std::vector<int> skip = mgs<__half, __half, float>(A, Q, R, get_eps<__half>(), get_eps<__half>(), __float2half(-1.0f));
-         }
-      });
-      cout << setw(15) << "MGS: " << fixed << setprecision(3) << mgs_time / static_cast<double>(ntests) << endl;
-      
-      A = Matrix<__half>(A_copy);
-      
-      double mgsr_time = measure_time([&]() {
-         for (int i = 0; i < ntests; i++) {
-            std::vector<int> skip = mgs<__half, __half, float>(A, Q, R);
-         }
-      });
-      cout << setw(15) << "MGS R: " << fixed << setprecision(3) << mgsr_time / static_cast<double>(ntests) << endl;
-
-      A = Matrix<__half>(A_copy);
-      
-      double mgs_v2_time = measure_time([&]() {
-         for (int i = 0; i < ntests; i++) {
-            std::vector<int> skip = mgs_v2<__half, __half, float>(A, Q, R);
-         }
-      });
-      cout << setw(15) << "MGS V2: " << fixed << setprecision(3) << mgs_v2_time / static_cast<double>(ntests) << endl;
-
-      A = Matrix<__half>(A_copy);
-      
-      double cgs_time = measure_time([&]() {
-         for (int i = 0; i < ntests; i++) {
-            std::vector<int> skip = cgs<__half, __half, float>(A, Q, R);
-         }
-      });
-      cout << setw(15) << "CGS: " << fixed << setprecision(3) << cgs_time / static_cast<double>(ntests) << endl;
-      
-      A = Matrix<__half>(A_copy);
-      
-      double cgs2_time = measure_time([&]() {
-         for (int i = 0; i < ntests; i++) {
-            std::vector<int> skip = cgs2<__half, __half, float>(A, Q, R);
-         }
-      });
-      cout << setw(15) << "CGS2: " << fixed << setprecision(3) << cgs2_time / static_cast<double>(ntests) << endl;
-
-      A = Matrix<__half>(A_copy);
-      
-      double hess_time = measure_time([&]() {
-         for (int i = 0; i < ntests; i++) {
-            std::vector<int> skip = hessenberg<__half, __half, float>(A, Q, R);
-         }
-      });
-      cout << setw(15) << "Hessenberg: " << fixed << setprecision(3) << hess_time / static_cast<double>(ntests) << endl;
-
-      A = Matrix<__half>(A_copy);
-      
-      double hess_v2_time = measure_time([&]() {
-         for (int i = 0; i < ntests; i++) {
-            std::vector<int> skip = hessenberg_v2<__half, __half, float>(A, Q, R);
-         }
-      });
-      cout << setw(15) << "Hessenberg V2: " << fixed << setprecision(3) << hess_v2_time / static_cast<double>(ntests) << endl;
-
-      A = Matrix<__half>(A_copy);
-      
-      double hess_v3_time = measure_time([&]() {
-         for (int i = 0; i < ntests; i++) {
-            std::vector<int> skip = hessenberg_v3<__half, __half, float>(A, Q, R);
-         }
-      });
-      cout << setw(15) << "Hessenberg V3: " << fixed << setprecision(3) << hess_v3_time / static_cast<double>(ntests) << endl;
-      cout << endl;
-      
+      compare_qr_methods<double, double>(m, n, repetitions, timer);
+      compare_qr_methods<float, float>(m, n, repetitions, timer);
+      compare_qr_methods<__half, float>(m, n, repetitions, timer);
    }
-   
-   // Cleanup CUDA resources
-   CUDAHandler::finalize();
-   
-   return 0;
+}
+
+} // namespace
+
+int main() {
+   bool cuda_initialized = false;
+
+   try {
+      CUDAHandler::init();
+      cuda_initialized = true;
+      run_benchmarks();
+
+      cuda_initialized = false;
+      CUDAHandler::finalize();
+      return EXIT_SUCCESS;
+   } catch (const std::exception& error) {
+      if (cuda_initialized) {
+         try {
+            cuda_initialized = false;
+            CUDAHandler::finalize();
+         } catch (const std::exception& cleanup_error) {
+            std::cerr << "CUDA cleanup failed: " << cleanup_error.what() << '\n';
+         }
+      }
+
+      std::cerr << "ex00 failed: " << error.what() << '\n';
+      return EXIT_FAILURE;
+   }
 }

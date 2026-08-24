@@ -713,6 +713,9 @@ int cgs2_step(
       // Reorthogonalize
       gemv<T_O, T_O, T_COMPUTE>(true, alpha_one, Q_prev, q_col, beta_zero, r_col_tmp);
 
+      // Apply the second projection to the current column.
+      gemv<T_O, T_O, T_COMPUTE>(false, alpha_neg_one, Q_prev, r_col_tmp, alpha_one, q_col);
+
       // Add correction to R
       axpy<T_O, T_O, T_COMPUTE>(alpha_one, r_col_tmp, r_col);
    }

@@ -369,5 +369,49 @@ add_test(NAME HessenbergTest
          COMMAND ${CMAKE_CURRENT_BINARY_DIR}/hessenberg_test
 )
 
+# The boundary and shape-sweep regressions are intentionally small; run them
+# under NVIDIA's memory checker when available so CTest catches invalid device
+# accesses as well as numerical failures.
+option(ENABLE_CUDA_MEMCHECK_TESTS "Enable lightweight CUDA memory-safety tests" ON)
+if(ENABLE_CUDA_MEMCHECK_TESTS)
+   find_program(COMPUTE_SANITIZER_EXECUTABLE
+      NAMES compute-sanitizer
+      HINTS
+         "${CUDAToolkit_BIN_DIR}"
+         "${CUDA_TOOLKIT_ROOT_DIR}/bin"
+   )
+   if(COMPUTE_SANITIZER_EXECUTABLE)
+      add_test(
+         NAME QRShapeMemcheck
+         COMMAND ${COMPUTE_SANITIZER_EXECUTABLE}
+                 --tool memcheck
+                 --error-exitcode=99
+                 --print-limit=20
+                 $<TARGET_FILE:qr_test>
+                 --gtest_filter=QRTest.MultipleShapesCudaRegression
+      )
+      set_tests_properties(QRShapeMemcheck PROPERTIES
+         LABELS "cuda;memcheck"
+         TIMEOUT 120
+      )
+
+      add_test(
+         NAME HessenbergMemcheck
+         COMMAND ${COMPUTE_SANITIZER_EXECUTABLE}
+                 --tool memcheck
+                 --error-exitcode=99
+                 --print-limit=20
+                 $<TARGET_FILE:hessenberg_test>
+                 --gtest_filter=HessenbergTest.TwoColumnBoundary:HessenbergTest.ShapeSweep
+      )
+      set_tests_properties(HessenbergMemcheck PROPERTIES
+         LABELS "cuda;memcheck"
+         TIMEOUT 120
+      )
+   else()
+      message(STATUS "compute-sanitizer not found; skipping CUDA memcheck tests")
+   endif()
+endif()
+
 # Enable testing
-enable_testing() 
+enable_testing()

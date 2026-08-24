@@ -531,9 +531,10 @@ std::vector<int> hessenberg(
 
       // Now compute the scale for all columns after it
       // We directly use GEMM to do this
+      const size_t remaining_cols = n - i - 1;
       Matrix<T_O> col_i_matrix(&Q(0, i), m, 1, Q.ld(), Location::kDEVICE);
-      Matrix<T_O> scale_matrix(&scale_factor_matrix(i+1, i), 1, n - i + 1, 1, Location::kDEVICE);
-      Matrix<T_O> result_matrix(&Q(0, i+1), m, n - i + 1, Q.ld(), Location::kDEVICE);
+      Matrix<T_O> scale_matrix(&scale_factor_matrix(i+1, i), 1, remaining_cols, 1, Location::kDEVICE);
+      Matrix<T_O> result_matrix(&Q(0, i+1), m, remaining_cols, Q.ld(), Location::kDEVICE);
       if constexpr (std::is_same_v<T_COMPUTE, double>) {
          double alpha = -1.0;
          double beta = 1.0;
